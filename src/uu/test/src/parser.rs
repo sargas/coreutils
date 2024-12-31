@@ -438,3 +438,20 @@ pub fn parse(args: Vec<OsString>) -> ParseResult<Vec<Symbol>> {
     p.parse()?;
     Ok(p.stack)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::parser::{parse, Symbol};
+
+    #[test]
+    fn simple_expressions() {
+        assert_eq!(
+            parse(vec!["(".into(), "true".into(), ")".into()]),
+            Ok(vec![Symbol::Literal("true".into())])
+        );
+        assert_eq!(
+            parse(vec!["!".into(), "true".into()]),
+            Ok(vec![Symbol::Literal("true".into()), Symbol::Bang])
+        );
+    }
+}

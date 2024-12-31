@@ -3315,6 +3315,8 @@ version = "0.0.28"
 dependencies = [
  "clap",
  "libc",
+ "rstest",
+ "tempfile",
  "uucore",
 ]
 

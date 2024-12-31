@@ -5,21 +5,25 @@
 
 // spell-checker:ignore (vars) egid euid FiletestOp StrlenOp
 
-pub(crate) mod error;
-mod parser;
-
-use clap::{crate_version, Command};
-use error::{ParseError, ParseResult};
-use parser::{parse, Operator, Symbol, UnaryOperator};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+
+use clap::{crate_version, Command};
+
+use error::{ParseError, ParseResult};
 use uucore::display::Quotable;
 use uucore::error::{UResult, USimpleError};
 #[cfg(not(windows))]
 use uucore::process::{getegid, geteuid};
 use uucore::{format_usage, help_about, help_section};
+
+pub(crate) mod error;
+mod evaluator;
+mod lexer;
+mod parser;
+mod parserv2;
 
 const ABOUT: &str = help_about!("test.md");
 
@@ -67,7 +71,11 @@ pub fn uumain(mut args: impl uucore::Args) -> UResult<()> {
         }
     }
 
-    let result = parse(args).map(|mut stack| eval(&mut stack))??;
+    let tokens = lexer::tokenize(args);
+    let expr = parserv2::Parser::new(&tokens).parse()?;
+    let result = evaluator::eval(&expr)?;
+
+    // let result = parse(args).map(|mut stack| eval(&mut stack))??;
 
     if result {
         Ok(())
@@ -75,160 +83,155 @@ pub fn uumain(mut args: impl uucore::Args) -> UResult<()> {
         Err(1.into())
     }
 }
-
-/// Evaluate a stack of Symbols, returning the result of the evaluation or
-/// an error message if evaluation failed.
-fn eval(stack: &mut Vec<Symbol>) -> ParseResult<bool> {
-    macro_rules! pop_literal {
-        () => {
-            match stack.pop() {
-                Some(Symbol::Literal(s)) => s,
-                _ => panic!(),
-            }
-        };
-    }
-
-    let s = stack.pop();
-
-    match s {
-        Some(Symbol::Bang) => {
-            let result = eval(stack)?;
-
-            Ok(!result)
-        }
-        Some(Symbol::Op(Operator::String(op))) => {
-            let b = stack.pop();
-            let a = stack.pop();
-            Ok(if op == "!=" { a != b } else { a == b })
-        }
-        Some(Symbol::Op(Operator::Int(op))) => {
-            let b = pop_literal!();
-            let a = pop_literal!();
-
-            Ok(integers(&a, &b, &op)?)
-        }
-        Some(Symbol::Op(Operator::File(op))) => {
-            let b = pop_literal!();
-            let a = pop_literal!();
-            Ok(files(&a, &b, &op)?)
-        }
-        Some(Symbol::UnaryOp(UnaryOperator::StrlenOp(op))) => {
-            let s = match stack.pop() {
-                Some(Symbol::Literal(s)) => s,
-                Some(Symbol::None) => OsString::from(""),
-                None => {
-                    return Ok(true);
-                }
-                _ => {
-                    return Err(ParseError::MissingArgument(op.quote().to_string()));
-                }
-            };
-
-            Ok(if op == "-z" {
-                s.is_empty()
-            } else {
-                !s.is_empty()
-            })
-        }
-        Some(Symbol::UnaryOp(UnaryOperator::FiletestOp(op))) => {
-            let op = op.to_str().unwrap();
-
-            let f = pop_literal!();
-
-            Ok(match op {
-                "-b" => path(&f, &PathCondition::BlockSpecial),
-                "-c" => path(&f, &PathCondition::CharacterSpecial),
-                "-d" => path(&f, &PathCondition::Directory),
-                "-e" => path(&f, &PathCondition::Exists),
-                "-f" => path(&f, &PathCondition::Regular),
-                "-g" => path(&f, &PathCondition::GroupIdFlag),
-                "-G" => path(&f, &PathCondition::GroupOwns),
-                "-h" => path(&f, &PathCondition::SymLink),
-                "-k" => path(&f, &PathCondition::Sticky),
-                "-L" => path(&f, &PathCondition::SymLink),
-                "-N" => path(&f, &PathCondition::ExistsModifiedLastRead),
-                "-O" => path(&f, &PathCondition::UserOwns),
-                "-p" => path(&f, &PathCondition::Fifo),
-                "-r" => path(&f, &PathCondition::Readable),
-                "-S" => path(&f, &PathCondition::Socket),
-                "-s" => path(&f, &PathCondition::NonEmpty),
-                "-t" => isatty(&f)?,
-                "-u" => path(&f, &PathCondition::UserIdFlag),
-                "-w" => path(&f, &PathCondition::Writable),
-                "-x" => path(&f, &PathCondition::Executable),
-                _ => panic!(),
-            })
-        }
-        Some(Symbol::Literal(s)) => Ok(!s.is_empty()),
-        Some(Symbol::None) | None => Ok(false),
-        Some(Symbol::BoolOp(op)) => {
-            if (op == "-a" || op == "-o") && stack.len() < 2 {
-                return Err(ParseError::UnaryOperatorExpected(op.quote().to_string()));
-            }
-
-            let b = eval(stack)?;
-            let a = eval(stack)?;
-
-            Ok(if op == "-a" { a && b } else { a || b })
-        }
-        _ => Err(ParseError::ExpectedValue),
-    }
-}
-
-/// Operations to compare integers
-/// `a` is the left hand side
-/// `b` is the left hand side
-/// `op` the operation (ex: -eq, -lt, etc)
-fn integers(a: &OsStr, b: &OsStr, op: &OsStr) -> ParseResult<bool> {
-    // Parse the two inputs
-    let a: i128 = a
-        .to_str()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| ParseError::InvalidInteger(a.quote().to_string()))?;
-
-    let b: i128 = b
-        .to_str()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| ParseError::InvalidInteger(b.quote().to_string()))?;
-
-    // Do the maths
-    Ok(match op.to_str() {
-        Some("-eq") => a == b,
-        Some("-ne") => a != b,
-        Some("-gt") => a > b,
-        Some("-ge") => a >= b,
-        Some("-lt") => a < b,
-        Some("-le") => a <= b,
-        _ => return Err(ParseError::UnknownOperator(op.quote().to_string())),
-    })
-}
+//
+// /// Evaluate a stack of Symbols, returning the result of the evaluation or
+// /// an error message if evaluation failed.
+// fn eval(stack: &mut Vec<Symbol>) -> ParseResult<bool> {
+//     macro_rules! pop_literal {
+//         () => {
+//             match stack.pop() {
+//                 Some(Symbol::Literal(s)) => s,
+//                 _ => panic!(),
+//             }
+//         };
+//     }
+//
+//     let s = stack.pop();
+//
+//     match s {
+//         Some(Symbol::Bang) => {
+//             let result = eval(stack)?;
+//
+//             Ok(!result)
+//         }
+//         Some(Symbol::Op(Operator::String(op))) => {
+//             let b = stack.pop();
+//             let a = stack.pop();
+//             Ok(if op == "!=" { a != b } else { a == b })
+//         }
+//         Some(Symbol::Op(Operator::Int(op))) => {
+//             let b = pop_literal!();
+//             let a = pop_literal!();
+//
+//             Ok(integers(&a, &b, &op)?)
+//         }
+//         Some(Symbol::Op(Operator::File(op))) => {
+//             let b = pop_literal!();
+//             let a = pop_literal!();
+//             Ok(files(&a, &b, &op)?)
+//         }
+//         Some(Symbol::UnaryOp(UnaryOperator::StrlenOp(op))) => {
+//             let s = match stack.pop() {
+//                 Some(Symbol::Literal(s)) => s,
+//                 Some(Symbol::None) => OsString::from(""),
+//                 None => {
+//                     return Ok(true);
+//                 }
+//                 _ => {
+//                     return Err(ParseError::MissingArgument(op.quote().to_string()));
+//                 }
+//             };
+//
+//             Ok(if op == "-z" {
+//                 s.is_empty()
+//             } else {
+//                 !s.is_empty()
+//             })
+//         }
+//         Some(Symbol::UnaryOp(UnaryOperator::FiletestOp(op))) => {
+//             let op = op.to_str().unwrap();
+//
+//             let f = pop_literal!();
+//
+//             Ok(match op {
+//                 "-b" => path(&f, &PathCondition::BlockSpecial),
+//                 "-c" => path(&f, &PathCondition::CharacterSpecial),
+//                 "-d" => path(&f, &PathCondition::Directory),
+//                 "-e" => path(&f, &PathCondition::Exists),
+//                 "-f" => path(&f, &PathCondition::Regular),
+//                 "-g" => path(&f, &PathCondition::GroupIdFlag),
+//                 "-G" => path(&f, &PathCondition::GroupOwns),
+//                 "-h" => path(&f, &PathCondition::SymLink),
+//                 "-k" => path(&f, &PathCondition::Sticky),
+//                 "-L" => path(&f, &PathCondition::SymLink),
+//                 "-N" => path(&f, &PathCondition::ExistsModifiedLastRead),
+//                 "-O" => path(&f, &PathCondition::UserOwns),
+//                 "-p" => path(&f, &PathCondition::Fifo),
+//                 "-r" => path(&f, &PathCondition::Readable),
+//                 "-S" => path(&f, &PathCondition::Socket),
+//                 "-s" => path(&f, &PathCondition::NonEmpty),
+//                 "-t" => isatty(&f)?,
+//                 "-u" => path(&f, &PathCondition::UserIdFlag),
+//                 "-w" => path(&f, &PathCondition::Writable),
+//                 "-x" => path(&f, &PathCondition::Executable),
+//                 _ => panic!(),
+//             })
+//         }
+//         Some(Symbol::Literal(s)) => Ok(!s.is_empty()),
+//         Some(Symbol::None) | None => Ok(false),
+//         Some(Symbol::BoolOp(op)) => {
+//             let b = eval(stack)?;
+//             let a = eval(stack)?;
+//
+//             Ok(if op == "-a" { a && b } else { a || b })
+//         }
+//         _ => Err(ParseError::ExpectedValue),
+//     }
+// }
+// /// Operations to compare integers
+// /// `a` is the left hand side
+// /// `b` is the left hand side
+// /// `op` the operation (ex: -eq, -lt, etc)
+// fn integers(a: &OsStr, b: &OsStr, op: &OsStr) -> ParseResult<bool> {
+//     // Parse the two inputs
+//     let a: i128 = a
+//         .to_str()
+//         .and_then(|s| s.parse().ok())
+//         .ok_or_else(|| ParseError::InvalidInteger(a.quote().to_string()))?;
+//
+//     let b: i128 = b
+//         .to_str()
+//         .and_then(|s| s.parse().ok())
+//         .ok_or_else(|| ParseError::InvalidInteger(b.quote().to_string()))?;
+//
+//     // Do the maths
+//     Ok(match op.to_str() {
+//         Some("-eq") => a == b,
+//         Some("-ne") => a != b,
+//         Some("-gt") => a > b,
+//         Some("-ge") => a >= b,
+//         Some("-lt") => a < b,
+//         Some("-le") => a <= b,
+//         _ => return Err(ParseError::UnknownOperator(op.quote().to_string())),
+//     })
+// }
 
 /// Operations to compare files metadata
 /// `a` is the left hand side
 /// `b` is the left hand side
 /// `op` the operation (ex: -ef, -nt, etc)
-fn files(a: &OsStr, b: &OsStr, op: &OsStr) -> ParseResult<bool> {
-    // Don't manage the error. GNU doesn't show error when doing
-    // test foo -nt bar
-    let f_a = match fs::metadata(a) {
-        Ok(f) => f,
-        Err(_) => return Ok(false),
-    };
-    let f_b = match fs::metadata(b) {
-        Ok(f) => f,
-        Err(_) => return Ok(false),
-    };
-
-    Ok(match op.to_str() {
-        #[cfg(unix)]
-        Some("-ef") => f_a.ino() == f_b.ino() && f_a.dev() == f_b.dev(),
-        #[cfg(not(unix))]
-        Some("-ef") => unimplemented!(),
-        Some("-nt") => f_a.modified().unwrap() > f_b.modified().unwrap(),
-        Some("-ot") => f_a.modified().unwrap() < f_b.modified().unwrap(),
-        _ => return Err(ParseError::UnknownOperator(op.quote().to_string())),
-    })
-}
+// fn files(a: &OsStr, b: &OsStr, op: &OsStr) -> ParseResult<bool> {
+//     // Don't manage the error. GNU doesn't show error when doing
+//     // test foo -nt bar
+//     let f_a = match fs::metadata(a) {
+//         Ok(f) => f,
+//         Err(_) => return Ok(false),
+//     };
+//     let f_b = match fs::metadata(b) {
+//         Ok(f) => f,
+//         Err(_) => return Ok(false),
+//     };
+//
+//     Ok(match op.to_str() {
+//         #[cfg(unix)]
+//         Some("-ef") => f_a.ino() == f_b.ino() && f_a.dev() == f_b.dev(),
+//         #[cfg(not(unix))]
+//         Some("-ef") => unimplemented!(),
+//         Some("-nt") => f_a.modified().unwrap() > f_b.modified().unwrap(),
+//         Some("-ot") => f_a.modified().unwrap() < f_b.modified().unwrap(),
+//         _ => return Err(ParseError::UnknownOperator(op.quote().to_string())),
+//     })
+// }
 
 fn isatty(fd: &OsStr) -> ParseResult<bool> {
     fd.to_str()
@@ -351,30 +354,5 @@ fn path(path: &OsStr, condition: &PathCondition) -> bool {
         PathCondition::UserIdFlag => false,
         PathCondition::Writable => false,   // TODO
         PathCondition::Executable => false, // TODO
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::integers;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn test_integer_op() {
-        let a = OsStr::new("18446744073709551616");
-        let b = OsStr::new("0");
-        assert!(!integers(a, b, OsStr::new("-lt")).unwrap());
-        let a = OsStr::new("18446744073709551616");
-        let b = OsStr::new("0");
-        assert!(integers(a, b, OsStr::new("-gt")).unwrap());
-        let a = OsStr::new("-1");
-        let b = OsStr::new("0");
-        assert!(integers(a, b, OsStr::new("-lt")).unwrap());
-        let a = OsStr::new("42");
-        let b = OsStr::new("42");
-        assert!(integers(a, b, OsStr::new("-eq")).unwrap());
-        let a = OsStr::new("42");
-        let b = OsStr::new("42");
-        assert!(!integers(a, b, OsStr::new("-ne")).unwrap());
     }
 }

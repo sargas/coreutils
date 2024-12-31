@@ -19,7 +19,11 @@ path = "src/test.rs"
 [dependencies]
 clap = { workspace = true }
 libc = { workspace = true }
-uucore = { workspace = true, features = ["process"] }
+uucore = { workspace = true, features = ["fs", "perms", "process", "quoting-style"] }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }
 
 [[bin]]
 name = "test"
